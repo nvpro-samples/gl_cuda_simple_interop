@@ -1,0 +1,391 @@
+/*
+ * Copyright (c) 2019-2021, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2021 NVIDIA CORPORATION
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+
+//--------------------------------------------------------------------------------------------------
+// Very simple Vulkan-OpenGL example:
+// - The vertex buffer is allocated with Vulkan, but used by OpenGL to render
+// - The animation is updating the buffer allocated by Vulkan, and the changes are
+//   reflected in the OGL render.
+//
+
+#ifdef WIN32
+#include <accctrl.h>
+#include <aclapi.h>
+#endif
+
+#include <array>
+#include <chrono>
+#include <iostream>
+#include <vulkan/vulkan.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+
+#include "backends/imgui_impl_glfw.h"
+#include "imgui.h"
+#include "imgui/backends/imgui_impl_gl.h"
+
+#include "compute.cuh"
+#include "nvgl/contextwindow_gl.hpp"
+#include "nvgl/extensions_gl.hpp"
+#include "nvpsystem.hpp"
+#include "nvvk/commands_vk.hpp"
+#include "nvvk/context_vk.hpp"
+#include "stb_image.h"
+#include "nvmath/nvmath.h"
+#include "nvvk/extensions_vk.hpp"
+
+//VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
+
+int const SAMPLE_SIZE_WIDTH  = 1200;
+int const SAMPLE_SIZE_HEIGHT = 900;
+
+
+// Getting the system time use for animation
+inline double getSysTime()
+{
+  auto now(std::chrono::system_clock::now());
+  auto duration = now.time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() / 1000.0;
+}
+
+// An array of 3 vectors which represents 3 vertices
+struct Vertex
+{
+  nvmath::vec3f pos;
+  nvmath::vec2f uv;
+};
+
+// The triangle
+static std::vector<Vertex> g_vertexDataVK = {{{-1.0f, -1.0f, 0.0f}, {0, 0}},
+                                             {{1.0f, -0.0f, 0.0f}, {1, 0}},
+                                             {{0.0f, 1.0f, 0.0f}, {0.5, 1}}};
+
+
+//--------------------------------------------------------------------------------------------------
+//
+//
+class InteropExample
+{
+public:
+  void prepare(uint32_t queueIdxCompute)
+  {
+    m_alloc.init(m_device, m_physicalDevice);
+
+    createShaders();   // Create the GLSL shaders
+    createBufferVK();  // Create the vertex buffer
+
+    // Initialize the Vulkan compute shader
+    m_compute.setup(m_device, m_physicalDevice);
+    m_compute.prepare(SAMPLE_SIZE_WIDTH, SAMPLE_SIZE_HEIGHT);
+    createTextureGL(m_alloc, m_compute.m_textureTarget, GL_RGBA8, GL_LINEAR, GL_LINEAR, GL_REPEAT);
+  }
+
+  void destroy()
+  {
+    vkDeviceWaitIdle(m_device);
+    m_bufferVk.destroy(m_alloc);
+    m_compute.destroy();
+  }
+
+  //--------------------------------------------------------------------------------------------------
+  // Create the vertex buffer with Vulkan
+  //
+  void createBufferVK()
+  {
+    m_bufferVk.bufVk = m_alloc.createBuffer(g_vertexDataVK.size() * sizeof(Vertex), VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    createBufferGL(m_alloc, m_bufferVk);
+
+    // Same as usual
+    int pos_loc = 0;
+    int uv_loc  = 1;
+    glCreateVertexArrays(1, &m_vertexArray);
+    glEnableVertexArrayAttrib(m_vertexArray, pos_loc);
+    glEnableVertexArrayAttrib(m_vertexArray, uv_loc);
+
+    glVertexArrayAttribFormat(m_vertexArray, pos_loc, 3, GL_FLOAT, GL_FALSE, offsetof(Vertex, pos));
+    glVertexArrayAttribBinding(m_vertexArray, pos_loc, 0);
+    glVertexArrayAttribFormat(m_vertexArray, uv_loc, 2, GL_FLOAT, GL_FALSE, offsetof(Vertex, uv));
+    glVertexArrayAttribBinding(m_vertexArray, uv_loc, 0);
+
+    glVertexArrayVertexBuffer(m_vertexArray, 0, m_bufferVk.oglId, 0, sizeof(Vertex));
+  }
+
+  //--------------------------------------------------------------------------------------------------
+  //
+  //
+  void onWindowRefresh()
+  {
+    glViewport(0, 0, m_size.width, m_size.height);
+
+    // Signal Vulkan it can use the texture
+    GLenum dstLayout = GL_LAYOUT_GENERAL_EXT;
+    glSignalSemaphoreEXT(m_compute.m_semaphores.glComplete, 0, nullptr, 1, &m_compute.m_textureTarget.oglId, &dstLayout);
+
+    // Invoking CUDA
+    m_compute.compute(m_size);
+
+    // Wait (on the GPU side) for the Vulkan semaphore to be signaled (finished compute)
+    GLenum srcLayout = GL_LAYOUT_GENERAL_EXT;
+    glWaitSemaphoreEXT(m_compute.m_semaphores.glReady, 0, nullptr, 1, &m_compute.m_textureTarget.oglId, &srcLayout);
+
+    glBindVertexArray(m_vertexArray);
+    glBindTextureUnit(0, m_compute.m_textureTarget.oglId);
+    glUseProgram(m_programID);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    // Printing stats
+    {
+      static float frameNumber{0};
+      static auto  tStart = std::chrono::high_resolution_clock::now();
+      auto         tEnd   = std::chrono::high_resolution_clock::now();
+      auto         tDiff  = std::chrono::duration<float, std::milli>(tEnd - tStart).count();
+      frameNumber++;
+      if(tDiff > 1000)
+      {
+        tStart   = tEnd;
+        auto fps = frameNumber / tDiff * 1000.f;
+        std::cout << "FPS: " << fps << std::endl;
+        frameNumber = 0;
+      }
+    }
+  }
+
+  //--------------------------------------------------------------------------------------------------
+  //
+  //
+  void animate()
+  {
+    auto t = getSysTime() / 2.0;
+    // Modify the buffer and upload it in the Vulkan allocated buffer
+    g_vertexDataVK[0].pos.x = float(sin(t));
+    g_vertexDataVK[1].pos.y = float(cos(t));
+    g_vertexDataVK[2].pos.x = -float(sin(t));
+
+    void* mapped = m_alloc.map(m_bufferVk.bufVk);
+    // This works because the buffer was created with vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
+    memcpy(mapped, g_vertexDataVK.data(), g_vertexDataVK.size() * sizeof(Vertex));
+    m_alloc.unmap(m_bufferVk.bufVk);
+  }
+
+  //--------------------------------------------------------------------------------------------------
+  // Creating the OpenGL shaders
+  //
+  GLuint createShaders()
+  {
+    // OpenGL - Create shaders
+    char buf[512];
+    int  len = 0;
+
+    // OpenGL 4.2 Core
+    GLuint        vs  = glCreateShader(GL_VERTEX_SHADER);
+    GLchar const* vss = {R"(
+      #version 450
+      layout(location = 0) in vec3 inVertex;
+      layout(location = 1) in vec2 inUV;
+      layout (location = 0) out vec2 outUV;
+
+      void main()
+      {
+        outUV = inUV;
+        gl_Position = vec4(inVertex, 1.0f);
+      }
+    )"};
+
+    glShaderSource(vs, 1, &vss, nullptr);
+    glCompileShader(vs);
+    glGetShaderInfoLog(vs, 512, (GLsizei*)&len, buf);
+
+    GLuint        fs  = glCreateShader(GL_FRAGMENT_SHADER);
+    GLchar const* fss = {R"(
+      #version 450
+      layout (location = 0) in vec2 inUV;
+      layout(location = 0) out vec4 fragColor;
+            
+      uniform sampler2D myTextureSampler;
+
+      void main()
+      {
+        vec3 color = texture( myTextureSampler, inUV ).rgb;
+        fragColor = vec4(color,1);
+      }
+            
+    )"};
+
+    glShaderSource(fs, 1, &fss, nullptr);
+    glCompileShader(fs);
+    glGetShaderInfoLog(fs, 512, (GLsizei*)&len, buf);
+
+    GLuint mSH2D = glCreateProgram();
+    glAttachShader(mSH2D, vs);
+    glAttachShader(mSH2D, fs);
+    glLinkProgram(mSH2D);
+
+    m_programID = mSH2D;
+    return mSH2D;
+  }
+
+  //--------------------------------------------------------------------------------------------------
+  // Initialization of the GUI
+  // - Need to be call after the device creation
+  //
+  void initUI(int width, int height)
+  {
+    m_size.width  = width;
+    m_size.height = height;
+
+    // UI
+    ImGui::CreateContext();
+    ImGui::InitGL();
+    ImGui::GetIO().IniFilename = nullptr;  // Avoiding the INI file
+  }
+
+  //- Override the default resize
+  void onFramebufferSize(int w, int h)
+  {
+    m_size.width  = w;
+    m_size.height = h;
+  }
+
+  void setup(VkInstance instance, VkDevice device, VkPhysicalDevice physicalDevice, uint32_t familyIndex)
+  {
+    m_device         = device;
+    m_physicalDevice = physicalDevice;
+  }
+
+
+private:
+  nvvkpp::BufferVkGL                     m_bufferVk;
+  nvvk::ExportResourceAllocatorDedicated m_alloc;
+
+  GLuint m_vertexArray = 0;  // VAO
+  GLuint m_programID   = 0;  // Shader program
+
+  ComputeImageVk   m_compute;  // Compute in Vulkan
+  VkDevice         m_device{VK_NULL_HANDLE};
+  VkPhysicalDevice m_physicalDevice{VK_NULL_HANDLE};
+  VkExtent2D       m_size{};
+};
+
+
+static int vsync{0};
+
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+  if(key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
+    glfwSetWindowShouldClose(window, 1);
+  if(key == GLFW_KEY_V && action == GLFW_PRESS)
+  {
+    vsync = (vsync + 1) % 2;
+    glfwSwapInterval(vsync);
+  }
+}
+
+//--------------------------------------------------------------------------------------------------
+//
+//
+int main(int argc, char** argv)
+{
+  // setup some basic things for the sample, logging file for example
+  NVPSystem system(PROJECT_NAME);
+
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
+  // Create window with graphics context
+  GLFWwindow* window = glfwCreateWindow(SAMPLE_SIZE_WIDTH, SAMPLE_SIZE_HEIGHT, PROJECT_NAME, NULL, NULL);
+  if(window == nullptr)
+    return 1;
+  glfwMakeContextCurrent(window);
+  glfwSwapInterval(vsync);  // Enable vsync
+  glfwSetKeyCallback(window, key_callback);
+
+  nvvk::ContextCreateInfo deviceInfo;
+  deviceInfo.setVersion(1, 3);
+  deviceInfo.addInstanceExtension(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
+  deviceInfo.addInstanceExtension(VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME);
+  deviceInfo.addDeviceExtension(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+  deviceInfo.addDeviceExtension(VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
+#ifdef WIN32
+  deviceInfo.addDeviceExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+  deviceInfo.addDeviceExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#else
+  deviceInfo.addDeviceExtension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+  deviceInfo.addDeviceExtension(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+#endif
+
+  // Creating the Vulkan instance and device
+  nvvk::Context vkctx;
+  vkctx.init(deviceInfo);
+
+
+  InteropExample      example;
+  nvgl::ContextWindow contextWindowGL;
+
+  // Loading all OpenGL symbols
+  load_GL(nvgl::ContextWindow::sysGetProcAddress);
+  if(!has_GL_EXT_semaphore)
+  {
+    LOGE("GL_EXT_semaphore Not Available !\n");
+    return 1;
+  }
+
+  example.setup(vkctx.m_instance, vkctx.m_device, vkctx.m_physicalDevice, vkctx.m_queueGCT.familyIndex);
+
+  // Printing which GPU we are using for Vulkan
+  VkPhysicalDeviceProperties pProperties;
+  vkGetPhysicalDeviceProperties(vkctx.m_physicalDevice, &pProperties);
+  LOGI("using %s", pProperties.deviceName);
+
+  // Initialize the window, UI ..
+  example.initUI(SAMPLE_SIZE_WIDTH, SAMPLE_SIZE_HEIGHT);
+
+  // Prepare the example
+  example.prepare(vkctx.m_queueGCT.familyIndex);
+
+
+  // GLFW Callback
+  ImGui_ImplGlfw_InitForOpenGL(window, false);
+
+  // Main loop
+  while(!glfwWindowShouldClose(window))
+  {
+    glfwPollEvents();
+    int w, h;
+    glfwGetWindowSize(window, &w, &h);
+    if(w == 0 || h == 0)
+      continue;
+
+    glClearColor(0.5f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    example.animate();
+    example.onWindowRefresh();
+
+    glfwSwapBuffers(window);
+  }
+  example.destroy();
+  vkctx.deinit();
+
+  glfwDestroyWindow(window);
+  glfwTerminate();
+
+  return 0;
+}
