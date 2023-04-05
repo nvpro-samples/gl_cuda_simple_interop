@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.5)
 
+get_filename_component(PROJNAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
+
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+
 # This must be set before enabling CUDA. Otherwise it will throw a warning.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   # 52 is the oldest compute capability supported by tha latest nvcc
@@ -8,7 +14,6 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 enable_language(CUDA)
 
-get_filename_component(PROJNAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
 Project(${PROJNAME})
 Message(STATUS "-------------------------------")
 Message(STATUS "Processing Project ${PROJNAME}:")
@@ -104,4 +109,6 @@ endforeach(RELEASELIB)
 
 _finalize_target( ${EXENAME} )
 
-
+else(CMAKE_CUDA_COMPILER)
+	Message(WARNING "Project ${PROJNAME} NOT built: CUDA not found. Please provide CMAKE_CUDA_COMPILER to the cmake invocation.")
+endif(CMAKE_CUDA_COMPILER)
