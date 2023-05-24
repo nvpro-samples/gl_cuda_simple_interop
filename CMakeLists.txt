@@ -6,11 +6,12 @@ include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
 
-# This must be set before enabling CUDA. Otherwise it will throw a warning.
+# CMake 3.18 added CMAKE_CUDA_ARCHITECTURES. This must be set before enabling
+# CUDA. Otherwise it will throw a warning. On versions < 3.18, setting this has
+# no effect.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  # 52 is the oldest compute capability supported by tha latest nvcc
-  message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined the default by nvv will be used.")
-  cmake_policy(SET CMP0104 OLD)
+  message(STATUS "CMAKE_CUDA_ARCHITECTURES is not defined, so nvcc's default will be used.")
+  set(CMAKE_CUDA_ARCHITECTURES OFF) # Non-empty; passes no architecture flags, so chooses default.
 endif()
 enable_language(CUDA)
 
