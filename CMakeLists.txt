@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.5)
 get_filename_component(PROJNAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
 
 include(CheckLanguage)
+enable_language(CXX)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
 
