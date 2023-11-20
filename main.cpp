@@ -45,7 +45,7 @@
 #include "nvvk/commands_vk.hpp"
 #include "nvvk/context_vk.hpp"
 #include "stb_image.h"
-#include "nvmath/nvmath.h"
+#include <glm/glm.hpp>
 #include "nvvk/extensions_vk.hpp"
 
 //VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
@@ -65,8 +65,8 @@ inline double getSysTime()
 // An array of 3 vectors which represents 3 vertices
 struct Vertex
 {
-  nvmath::vec3f pos;
-  nvmath::vec2f uv;
+  glm::vec3 pos;
+  glm::vec2 uv;
 };
 
 // The triangle
