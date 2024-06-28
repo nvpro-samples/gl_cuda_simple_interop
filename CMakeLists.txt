@@ -4,6 +4,7 @@ get_filename_component(PROJNAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
 
 include(CheckLanguage)
 enable_language(CXX)
+set(CMAKE_CUDA_STANDARD 17) # Since CMake <= 3.24 doesn't know that CUDA 12 supports C++20
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
 
